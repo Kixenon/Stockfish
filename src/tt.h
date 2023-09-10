@@ -23,6 +23,7 @@
 #include <cstdint>
 
 #include "misc.h"
+#include "position.h"
 #include "types.h"
 
 namespace Stockfish {
@@ -86,7 +87,7 @@ class TranspositionTable {
 public:
  ~TranspositionTable() { aligned_large_pages_free(table); }
   void new_search() { generation8 += GENERATION_DELTA; } // Lower bits are used for other things
-  TTEntry* probe(const Key key, bool& found) const;
+  TTEntry* probe(const Position& pos, bool& found) const;
   int hashfull() const;
   void resize(size_t mbSize);
   void clear();
