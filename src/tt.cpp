@@ -129,7 +129,7 @@ TTEntry* TranspositionTable::probe(const Position& pos, bool& found) const {
       {
           tte[i].genBound8 = uint8_t(generation8 | (tte[i].genBound8 & (GENERATION_DELTA - 1))); // Refresh
 
-          return found = (bool)tte[i].depth8 && pos.pseudo_legal((Move)tte[i].move16), &tte[i];
+          return found = (bool)tte[i].depth8 && (!tte[i].move16 || pos.pseudo_legal((Move)tte[i].move16)), &tte[i];
       }
 
   // Find an entry to be replaced according to the replacement strategy
