@@ -264,24 +264,262 @@ template ExtMove* generate<NON_EVASIONS>(const Position&, ExtMove*);
 
 /// generate<LEGAL> generates all the legal moves in the given position
 
+// template<>
+// ExtMove* generate<LEGAL>(const Position& pos, ExtMove* moveList) {
+
+//   Color us = pos.side_to_move();
+//   Bitboard pinned = pos.blockers_for_king(us) & pos.pieces(us);
+//   Square ksq = pos.square<KING>(us);
+//   ExtMove* cur = moveList;
+
+//   moveList = pos.checkers() ? generate<EVASIONS    >(pos, moveList)
+//                             : generate<NON_EVASIONS>(pos, moveList);
+//   while (cur != moveList)
+//       if (  ((pinned & from_sq(*cur)) || from_sq(*cur) == ksq || type_of(*cur) == EN_PASSANT)
+//           && !pos.legal(*cur))
+//           *cur = (--moveList)->move;
+//       else
+//           ++cur;
+
+//   return moveList;
+// }
+
+//generate attacks
+template<Color attacker>
+    constexpr Bitboard generate_attacks(const Position& pos){
+        //slider attacks should go through king
+        Bitboard occupancy = pos.pieces() & ~pos.pieces(~attacker, KING);
+
+        Bitboard attacks = pawn_attacks_bb<attacker>(pos.pieces(attacker, PAWN));
+        attacks |= attacks_bb<KING>(pos.square<KING>(attacker));
+
+        Bitboard bb = pos.pieces(attacker, KNIGHT);
+        while (bb){
+            attacks |= attacks_bb<KNIGHT>(pop_lsb(bb));
+        }
+        bb = pos.pieces(attacker, ROOK, QUEEN);
+        while (bb){
+            attacks |= attacks_bb<ROOK>(pop_lsb(bb), occupancy); 
+        }
+        bb = pos.pieces(attacker, BISHOP, QUEEN);
+        while (bb){
+            attacks |= attacks_bb<BISHOP>(pop_lsb(bb), occupancy);
+        }
+        return attacks;
+    }
+
+//legal movegen
+template<Color Us>
+ExtMove* generate_legal(const Position& pos, ExtMove* moveList) {
+    constexpr Color Them = ~Us;
+    constexpr Direction Up = pawn_push(Us);
+
+    Square sq;
+    Bitboard bb, attacks;
+
+    const Square ksq = pos.square<KING>(Us);
+    const Bitboard theirAttacks = generate_attacks<Them>(pos);
+
+    attacks = attacks_bb<KING>(ksq) & ~pos.pieces(Us) & ~theirAttacks;
+
+    while (attacks)
+        *moveList++ = make_move(ksq, pop_lsb(attacks));
+
+    if (popcount(pos.checkers()) > 1) return moveList;
+
+    const Bitboard checkMask = pos.checkers() ? between_bb(ksq, lsb(pos.checkers())) : ~0ull;
+    const Bitboard them = pos.pieces(Them) & checkMask;
+    const Bitboard occ = pos.pieces(); //occupancy
+
+    //find rook pins and bishop pins
+    Bitboard rpins = attacks_bb<ROOK  >(ksq) & pos.pinners(Them);
+    Bitboard rpinMask = 0ull;
+    while (rpins)
+        rpinMask |= between_bb(ksq, pop_lsb(rpins));
+
+    Bitboard bpins = attacks_bb<BISHOP>(ksq) & pos.pinners(Them);
+    Bitboard bpinMask = 0ull;
+    while (bpins)
+        bpinMask |= between_bb(ksq, pop_lsb(bpins));
+    
+    const Bitboard unpinned = ~(bpinMask | rpinMask);
+
+    //castling, not available for 960 for now
+    if (!pos.checkers() && pos.can_castle(Us & ANY_CASTLING)){
+        constexpr CastlingRights crk = Us & KING_SIDE;
+        constexpr CastlingRights crq = Us & QUEEN_SIDE;
+
+        if (!pos.castling_impeded(crk) && pos.can_castle(crk))
+            if (!(theirAttacks & (Us == WHITE ? SQ_F1 | SQ_G1 : SQ_F8 | SQ_G8)))
+                *moveList++ = make<CASTLING>(ksq, pos.castling_rook_square(crk));
+
+        if (!pos.castling_impeded(crq) && pos.can_castle(crq))
+            if (!(theirAttacks & (Us == WHITE ? SQ_D1 | SQ_C1 : SQ_D8 | SQ_C8)))
+                *moveList++ = make<CASTLING>(ksq, pos.castling_rook_square(crq));
+    }
+
+    if (pos.ep_square() != SQ_NONE
+    // && pawn_attacks_bb(Them, pos.ep_square()) & pos.pieces(Us, PAWN) //should already be checked for when making move
+    && checkMask & (pos.ep_square() - Up)){
+        const Square capsq = pos.ep_square() - Up;
+
+        //horizontal rook attacks "seeing through" ep captured pawn
+        Bitboard eppin = attacks_bb<ROOK>(ksq, occ ^ capsq) & pos.pieces(Us);
+        eppin = attacks_bb<ROOK>(ksq, (occ & ~eppin) ^ capsq) & pos.pieces(Them, ROOK, QUEEN) & rank_bb(ksq);
+
+        //ensure pinner rook is aligned with ray cast from king, can definitely be precomputed into an array like ray[ksq][left/right]
+        eppin &= attacks_bb<ROOK>(ksq) & attacks_bb<ROOK>(capsq, square_bb(ksq));
+
+        const Bitboard eppinMask = eppin ? between_bb(ksq, pop_lsb(eppin)) : 0; //only one possible horizontal rook ep pin at a time
+        
+        //ep pawn can only be captured by us if it's not pinned / pinned vertically
+        //and our own pawn can't capture if it's pinned by a rook
+        if (!((bpinMask | eppinMask) & capsq)){
+            bb = pawn_attacks_bb(Them, pos.ep_square()) & pos.pieces(Us, PAWN) & unpinned;
+            while (bb)
+                *moveList++ = make<EN_PASSANT>(pop_lsb(bb), pos.ep_square());
+        }
+    }
+
+    constexpr Direction UpRight  = Us == WHITE ? NORTH_EAST : SOUTH_WEST;
+    constexpr Direction UpLeft   = Us == WHITE ? NORTH_WEST : SOUTH_EAST;
+    constexpr Bitboard rank7R = Us == WHITE ? Rank7BB : Rank2BB; //relative rank 7
+    constexpr Bitboard rank3R = Us == WHITE ? Rank3BB : Rank6BB; //relative rank 3
+    const Bitboard rpinMask_h = rpinMask & rank_bb(ksq); //horizontal pins
+    const Bitboard emptySquares = ~occ;
+    const Bitboard notUs = ~pos.pieces(Us);
+    const Bitboard pawnsOn7    = pos.pieces(Us, PAWN) &  rank7R;
+    const Bitboard pawnsNotOn7 = pos.pieces(Us, PAWN) & ~rank7R;
+
+    Bitboard piece_bb;
+
+    if (pawnsOn7)
+    {
+        //unpinned promotion captures
+        Bitboard b1 = shift<UpRight>(pawnsOn7 & unpinned) & them;
+        Bitboard b2 = shift<UpLeft >(pawnsOn7 & unpinned) & them;
+
+        while (b1)
+            moveList = make_promotions<CAPTURES, UpRight, true>(moveList, pop_lsb(b1));
+
+        while (b2)
+            moveList = make_promotions<CAPTURES, UpLeft, true>(moveList, pop_lsb(b2));
+
+        //pinned promotion captures
+        Bitboard b3 = pawnsOn7 & bpinMask & ~rpinMask;
+        b1 = shift<UpLeft >(b3) & them & bpinMask;
+        b1 = shift<UpRight>(b3) & them & bpinMask;
+
+        while (b1)
+            moveList = make_promotions<CAPTURES, UpRight, true>(moveList, pop_lsb(b1));
+
+        while (b2)
+            moveList = make_promotions<CAPTURES, UpLeft, true>(moveList, pop_lsb(b2));
+
+        //push promotion, pinned pawns cannot push promote
+        b3 = shift<Up>(pawnsOn7 & unpinned) & emptySquares & checkMask;
+
+        while (b3)
+            moveList = make_promotions<NON_EVASIONS, Up,    false>(moveList, pop_lsb(b3));
+    }
+
+    //unpined normal captures
+    bb = shift<UpLeft>(pawnsNotOn7 & unpinned) & them;
+    while (bb){
+        sq = pop_lsb(bb);
+        *moveList++ = make_move(sq - UpLeft, sq);
+    }
+    bb = shift<UpRight>(pawnsNotOn7 & unpinned) & them;
+    while (bb){
+        sq = pop_lsb(bb);
+        *moveList++ = make_move(sq - UpRight, sq);
+    }
+
+    //pinned normal captures
+    piece_bb = pawnsNotOn7 & bpinMask & ~rpinMask;
+    bb = shift<UpLeft>(piece_bb) & them & bpinMask;
+    while (bb){
+        sq = pop_lsb(bb);
+        *moveList++ = make_move(sq - UpLeft, sq);
+    }
+    bb = shift<UpRight>(piece_bb) & them & bpinMask;
+    while (bb){
+        sq = pop_lsb(bb);
+        *moveList++ = make_move(sq - UpRight, sq);
+    }
+
+    //pawn push, those pinned by bishop / horizontal rook cannot push
+    //single push
+    piece_bb = shift<Up>(pawnsNotOn7 & ~bpinMask & ~rpinMask_h) & emptySquares;
+    bb = piece_bb & checkMask;
+    while (bb){
+        sq = pop_lsb(bb);
+        *moveList++ = make_move(sq - Up, sq);
+    }
+
+    //double push
+    bb = shift<Up>(piece_bb & rank3R) & emptySquares & checkMask;
+    while (bb){
+        sq = pop_lsb(bb);
+        *moveList++ = make_move(sq - Up - Up, sq);
+    }
+
+    //knight moves, pinned knights can't move
+    bb = pos.pieces(Us, KNIGHT) & unpinned;
+    while (bb){
+        sq = pop_lsb(bb);
+        attacks = attacks_bb<KNIGHT>(sq) & notUs & checkMask;
+        while (attacks)
+            *moveList++ = make_move(sq, pop_lsb(attacks));
+    }
+
+    //unpinned bishop moves
+    piece_bb = pos.pieces(Us, BISHOP, QUEEN);
+    bb = piece_bb & unpinned;
+    while (bb){
+        sq = pop_lsb(bb);
+        attacks = attacks_bb<BISHOP>(sq, occ) & notUs & checkMask;
+        while (attacks)
+            *moveList++ = make_move(sq, pop_lsb(attacks));
+    }
+
+    //pinned bishop moves
+    //we only need to check for bishop pins, since a piece cannot be pinned by both bishop and rook at the same time
+    bb = piece_bb & bpinMask;
+    while (bb){
+        sq = pop_lsb(bb);
+        attacks = attacks_bb<BISHOP>(sq, occ) & notUs & checkMask & bpinMask;
+        while (attacks)
+            *moveList++ = make_move(sq, pop_lsb(attacks));
+    }
+
+    //unpinned rook moves
+    piece_bb = pos.pieces(Us, ROOK, QUEEN);
+    bb = piece_bb & unpinned;
+    while (bb){
+        sq = pop_lsb(bb);
+        attacks = attacks_bb<ROOK>(sq, occ) & notUs & checkMask;
+        while (attacks)
+            *moveList++ = make_move(sq, pop_lsb(attacks));
+    }
+
+    //pinned rook moves, same logic
+    bb = piece_bb & rpinMask;
+    while (bb){
+        sq = pop_lsb(bb);
+        attacks = attacks_bb<ROOK>(sq, occ) & notUs & checkMask & rpinMask;
+        while (attacks)
+            *moveList++ = make_move(sq, pop_lsb(attacks));
+    }
+
+    return moveList;
+}
+
 template<>
 ExtMove* generate<LEGAL>(const Position& pos, ExtMove* moveList) {
-
-  Color us = pos.side_to_move();
-  Bitboard pinned = pos.blockers_for_king(us) & pos.pieces(us);
-  Square ksq = pos.square<KING>(us);
-  ExtMove* cur = moveList;
-
-  moveList = pos.checkers() ? generate<EVASIONS    >(pos, moveList)
-                            : generate<NON_EVASIONS>(pos, moveList);
-  while (cur != moveList)
-      if (  ((pinned & from_sq(*cur)) || from_sq(*cur) == ksq || type_of(*cur) == EN_PASSANT)
-          && !pos.legal(*cur))
-          *cur = (--moveList)->move;
-      else
-          ++cur;
-
-  return moveList;
+    return pos.side_to_move() == WHITE ?  generate_legal<WHITE>(pos, moveList)
+                                        : generate_legal<BLACK>(pos, moveList);
 }
+
 
 } // namespace Stockfish
